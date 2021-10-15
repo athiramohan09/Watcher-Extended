@@ -68,9 +68,8 @@ export class DnsMonitored extends Component {
                 <Modal.Header closeButton>
                     <Modal.Title>Action Requested</Modal.Title>
                 </Modal.Header>
-                <Modal.Body>Are you sure you want to <b><u>delete</u></b> <b>{this.state.word}</b> domain name and
-                    the <b>associated
-                        alerts</b>?</Modal.Body>
+                <Modal.Body>Are you sure you want to <b><u>delete</u></b> <b>{this.state.word}</b> domain name, the
+                <b> associated alerts</b>, and <b>twisted dns</b>?</Modal.Body>
                 <Modal.Footer>
                     <form onSubmit={onSubmit}>
                         <Button variant="secondary" className="mr-2" onClick={handleClose}>
@@ -223,6 +222,7 @@ export class DnsMonitored extends Component {
                     <div className="col-lg-12">
                         <div className="float-left">
                             <h4>Corporate DNS Assets Monitored</h4>
+                            <h6 className="text-muted">Dnstwist Algorithm</h6>
                         </div>
                         <div className="float-right mr-1 mb-2">
                             <button className="btn btn-success" onClick={() => {
