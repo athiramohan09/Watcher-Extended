@@ -1,6 +1,7 @@
 import React, { Component, Fragment } from 'react';
 import WatchRules from './WatchRules';
 import CyberWatchStats from './CyberWatchStats';
+import DailyReports from './DailyReports';
 import MonitoredKeywordsPanel from './MonitoredKeywordsPanel';
 import SourcesPanel from './SourcesPanel';
 import BannedWordsPanel from './BannedWordsPanel';
@@ -88,6 +89,16 @@ class CyberWatchDashboard extends Component {
     render() {
         return (
             <Fragment>
+                <div className="card shadow-sm mb-3">
+                    <div className="card-body">
+                        <h5 className="card-title mb-1">Daily Threat Reports</h5>
+                        <p className="text-muted small mb-3">
+                            Download the daily PDF reports generated from Cyber Watch data.
+                            The latest report is always at the top of the list.
+                        </p>
+                        <DailyReports />
+                    </div>
+                </div>
                 <PanelGrid
                     panels={this.buildPanels()}
                     defaultLayout={DEFAULT_LAYOUT}

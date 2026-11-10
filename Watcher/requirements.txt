@@ -49,3 +49,6 @@ mozilla-django-oidc==5.0.2
 
 # Numerical computation
 numpy==1.26.4
+
+# PDF Generation and Reporting
+reportlab==4.4.10

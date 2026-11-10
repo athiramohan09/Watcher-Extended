@@ -317,3 +317,29 @@ dist
 
 # TernJS port file
 .tern-port
+
+# Environment credentials
+.env
+.env.*
+
+# ZIP archives
+*.zip
+
+# Backup files
+*.bak
+* - Copy.py
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Node dependencies
+node_modules/
+
+# Generated reports
+
+# Generated Cyber Watch PDF reports
+Watcher/Watcher/reports/*.pdf
+
+# Generated Cyber Watch PDF reports
+Watcher/Watcher/reports/*.pdf

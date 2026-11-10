@@ -12,9 +12,71 @@ import tzlocal
 from .models import CVEAlert, RansomwareGroup, RansomwareVictim, WatchRule, WatchRuleHit, Subscriber
 from common.core import send_app_specific_notifications
 from django.db.models import Q
+from .reports import generate_daily_threat_report
 
 # Configure logger
 logger = logging.getLogger('watcher.cyber_watch')
+
+# ---------------------------------------------------------------------------
+# FIX (2026-10-26, sher/Watcher-personalised):
+# Upstream feeds changed shape in 2026 and the old code failed silently:
+#  * ransomware.live v2/* now returns 404 / HTML, not JSON -> resp.json()
+#    raised and the whole ransomware section stayed empty with only a
+#    log line nobody sees in the UI.
+#  * ransomlook /api/recent items use post_title/group_name, not
+#    name/group, so the old victim loop skipped every single item.
+#  * circl /api/last now mixes OSV/PYSEC items and CVE-JSON items
+#    (cveMetadata.cveId + containers.cna.descriptions). The old
+#    description fallback missed several of those.
+# _get_json() makes a feed failure explicit (ok/data/error) instead of
+# crashing, and the fetchers below fall back to the source that works.
+# ---------------------------------------------------------------------------
+
+def _get_json(url, timeout=20):
+    """GET url and return (data, error). error is None on success.
+
+    A 404, an HTML page (dead API returning its website) or bad JSON
+    all return an error string instead of raising - callers can then
+    log it, report source health, and continue with the next source.
+    """
+    try:
+        resp = requests.get(url, timeout=timeout)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    content_type = resp.headers.get('Content-Type', '')
+    if 'json' not in content_type and resp.text.lstrip().startswith('<'):
+        return None, f"non-JSON response (HTML, HTTP {resp.status_code}) - API endpoint may be dead"
+    try:
+        return resp.json(), None
+    except ValueError as exc:
+        return None, f"invalid JSON: {exc}"
+
+
+def _extract_cve_description(item):
+    """Best-effort description for both old CIRCL items and CVE-JSON items."""
+    cna = (((item.get('containers') or {}).get('cna') or {}).get('descriptions') or [])
+    cna_text = cna[0].get('value', '') if cna else ''
+    adp = (((item.get('containers') or {}).get('adp') or [{}])[0].get('descriptions') or [])
+    adp_text = adp[0].get('value', '') if adp else ''
+    top_desc = ''
+    descs = item.get('descriptions') or []
+    if descs and isinstance(descs[0], dict):
+        top_desc = descs[0].get('value', '')
+    affected = item.get('affected') or []
+    affected_text = ''
+    if affected and isinstance(affected[0], dict):
+        affected_text = affected[0].get('product', '') or ''
+    return (
+        item.get('title', '')
+        or item.get('summary', '')
+        or item.get('details', '')
+        or top_desc
+        or cna_text
+        or adp_text
+        or (f"Affects {affected_text}" if affected_text else '')
+    )
+
 
 
 def start_scheduler():
@@ -23,6 +85,7 @@ def start_scheduler():
         - Fetch latest CVEs every 30 minutes.
         - Fetch ransomware data every 30 minutes.
         - Fetch RansomLook data every 30 minutes.
+        - Generate daily threat report daily at 08:00.
     """
     scheduler = BackgroundScheduler(timezone=str(tzlocal.get_localzone()))
     scheduler.add_job(fetch_latest_cves, 'interval', minutes=30, id='fetch_latest_cves',
@@ -32,6 +95,9 @@ def start_scheduler():
         max_instances=1,
         replace_existing=True)
     scheduler.add_job(fetch_ransomlook_data, 'interval', minutes=30, id='fetch_ransomlook_data',
+        max_instances=1,
+        replace_existing=True)
+    scheduler.add_job(generate_daily_threat_report, 'cron', hour=8, minute=0, id='daily_threat_report',
         max_instances=1,
         replace_existing=True)
     scheduler.start()
@@ -170,9 +236,17 @@ def fetch_latest_cves():
         close_old_connections()
         logger.info("CRON TASK : Fetch latest CVEs from cve.circl.lu")
 
-        resp = requests.get(get_cyberwatch_cve_config()['cve_api_url'], timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        cve_url = get_cyberwatch_cve_config()['cve_api_url']
+        data, err = _get_json(cve_url, timeout=15)
+        if err:
+            logger.error(f"CVE API unavailable at {cve_url}: {err} - CVE list will not update this run")
+            return
+        if isinstance(data, dict):
+            # Some CIRCL responses wrap the list, e.g. {"results": [...]}
+            data = data.get('results') or data.get('data') or data.get('vulnerabilities') or []
+        if not isinstance(data, list):
+            logger.error(f"CVE API returned unexpected shape: {type(data).__name__}")
+            return
 
         def normalize_severity(raw, fallback=''):
             if isinstance(raw, str):
@@ -247,19 +321,17 @@ def fetch_latest_cves():
             return raw_id
         
         new_count = 0
+        skipped_count = 0
         for item in data:
+            if not isinstance(item, dict):
+                skipped_count += 1
+                continue
             cve_id = extract_cve_id(item)
             if not cve_id:
+                skipped_count += 1
                 continue
 
-            cna_descriptions = (((item.get('containers') or {}).get('cna') or {}).get('descriptions') or [])
-            description = (
-                item.get('title', '')
-                or item.get('summary', '')
-                or item.get('details', '')
-                or ((item.get('descriptions') or [{}])[0].get('value', '') if item.get('descriptions') else '')
-                or (cna_descriptions[0].get('value', '') if cna_descriptions else '')
-            )
+            description = _extract_cve_description(item)
 
             published_raw = (
                 item.get('Published')
@@ -307,7 +379,7 @@ def fetch_latest_cves():
             # Check if this CVE matches any active watch rules
             _check_watch_rules_for_cve(obj)
 
-        logger.info(f"CVE fetch complete - {new_count} new CVEs added")
+        logger.info(f"CVE fetch complete - {new_count} new CVEs added, {skipped_count} items skipped (no usable CVE id), {len(data)} total in feed")
 
     except requests.exceptions.RequestException as e:
         logger.error(f"CVE API request error: {e}")
@@ -326,11 +398,16 @@ def fetch_ransomware_data():
     logger.info("CRON TASK : Fetch ransomware groups and victims from ransomware.live")
     
     try:
-        resp = requests.get(get_ransomware_live_config()['groups_url'], timeout=20)
-        resp.raise_for_status()
-        
+        groups_url = get_ransomware_live_config()['groups_url']
+        groups_data, groups_err = _get_json(groups_url, timeout=20)
+        if groups_err:
+            # FIX: ransomware.live v2 API is dead (404/HTML as of Oct 2026).
+            # Do NOT crash the job - ransomlook (below) still populates
+            # RansomwareGroup/RansomwareVictim, so the page is not empty.
+            logger.warning(f"Ransomware.live groups unavailable at {groups_url}: {groups_err} - skipping, ransomlook remains the working source")
+            groups_data = []
         group_count = 0
-        for g in resp.json():
+        for g in groups_data:
             name = g.get('name', '').strip()
             if not name:
                 continue
@@ -355,11 +432,13 @@ def fetch_ransomware_data():
         logger.error(f"Ransomware groups fetch error: {e}")
 
     try:
-        resp = requests.get(get_ransomware_live_config()['victims_url'], timeout=20)
-        resp.raise_for_status()
-
+        victims_url = get_ransomware_live_config()['victims_url']
+        victims_data, victims_err = _get_json(victims_url, timeout=20)
+        if victims_err:
+            logger.warning(f"Ransomware.live victims unavailable at {victims_url}: {victims_err} - skipping, ransomlook remains the working source")
+            victims_data = []
         new_count = 0
-        for v in resp.json():
+        for v in victims_data:
             group_name = (v.get('group_name', '') or v.get('group', '')).strip()
             if not group_name:
                 continue
@@ -472,12 +551,18 @@ def fetch_ransomlook_data():
         logger.error(f"RansomLook groups fetch error: {e}")
 
     try:
-        resp = requests.get(get_ransomlook_config()['recent_url'], timeout=20)
-        resp.raise_for_status()
-
+        recent_url = get_ransomlook_config()['recent_url']
+        recent_data, recent_err = _get_json(recent_url, timeout=20)
+        if recent_err:
+            logger.error(f"RansomLook recent unavailable at {recent_url}: {recent_err}")
+            recent_data = []
         victim_count = 0
-        for v in resp.json():
-            group_name = (v.get('group', '') or v.get('actor', '')).strip()
+        for v in recent_data:
+            # FIX: ransomlook /api/recent actually returns
+            #   post_title, group_name, discovered, link, description
+            # not name/group/organization. The old mapping skipped
+            # every victim, so the page stayed empty despite HTTP 200.
+            group_name = (v.get('group_name', '') or v.get('group', '') or v.get('actor', '') or '').strip()
             if not group_name:
                 continue
 
@@ -486,7 +571,7 @@ def fetch_ransomlook_data():
                 defaults={'source': 'ransomlook.io', 'fetched_at': timezone.now()}
             )
 
-            victim_name = (v.get('name', '') or v.get('organization', '')).strip()
+            victim_name = (v.get('post_title', '') or v.get('name', '') or v.get('organization', '') or '').strip()
             if not victim_name:
                 continue
 
@@ -507,7 +592,7 @@ def fetch_ransomlook_data():
                 defaults={
                     'country': v.get('country') or '',
                     'sector': v.get('industry') or v.get('sector') or '',
-                    'url': v.get('url', ''),
+                    'url': v.get('link') or v.get('url', ''),
                     'fetched_at': timezone.now(),
                 }
             )

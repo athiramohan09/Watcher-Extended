@@ -69,7 +69,8 @@ services:
 
   watcher:
     container_name: watcher
-    image: ghcr.io/thalesgroup-cert/watcher:latest
+    image: watcher-fixed:latest
+    build: ./Watcher
     depends_on:
       db_watcher:
         condition: service_healthy
@@ -86,6 +87,8 @@ services:
       - .env
     environment:
       no_proxy: "10.10.10.3,10.10.10.5,10.10.10.6,10.10.10.7,certstream"
+    volumes:
+      - ./Watcher/Watcher:/app/Watcher
     ports:
       - "9002:9002"
     healthcheck:
