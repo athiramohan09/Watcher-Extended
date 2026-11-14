@@ -2,6 +2,7 @@ import React, { Component, Fragment } from 'react';
 import WatchRules from './WatchRules';
 import CyberWatchStats from './CyberWatchStats';
 import DailyReports from './DailyReports';
+import PriorityQueue from './PriorityQueue';
 import MonitoredKeywordsPanel from './MonitoredKeywordsPanel';
 import SourcesPanel from './SourcesPanel';
 import BannedWordsPanel from './BannedWordsPanel';
@@ -89,6 +90,18 @@ class CyberWatchDashboard extends Component {
     render() {
         return (
             <Fragment>
+                <div className="card shadow-sm mb-3">
+                    <div className="card-body">
+                        <h5 className="card-title mb-1">Patch First — Priority Queue</h5>
+                        <p className="text-muted small mb-3">
+                            CVEs ranked by exploit risk, not by CVSS alone. Risk score =
+                            KEV +40, EPSS x30, CVSS x2, published in the last 30 days +10.
+                            EPSS is FIRST&apos;s machine-learning model; KEV means CISA lists
+                            the CVE as known exploited. Run enrich_risk_scores to score CVEs.
+                        </p>
+                        <PriorityQueue />
+                    </div>
+                </div>
                 <div className="card shadow-sm mb-3">
                     <div className="card-body">
                         <h5 className="card-title mb-1">Daily Threat Reports</h5>

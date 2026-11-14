@@ -19,6 +19,21 @@ class CVEAlert(models.Model):
     fetched_at   = models.DateTimeField(default=timezone.now)
     is_archived  = models.BooleanField(default=False)
 
+    # --- AI risk scoring / vulnerability prioritisation (2026-11-10) ---
+    # EPSS is FIRST's machine-learning model: the probability (0-1) that
+    # this CVE is exploited in the next 30 days. CISA KEV means it is
+    # already known to be exploited in the wild. risk_score is our
+    # transparent 0-100 combination (see cyber_watch/core.py:
+    # calculate_risk_score). None of these fields are trained on the
+    # user's local CVE set - EPSS is the pre-trained FIRST model.
+    epss_score      = models.FloatField(null=True, blank=True)
+    epss_percentile = models.FloatField(null=True, blank=True)
+    is_kev          = models.BooleanField(default=False)
+    kev_date_added  = models.DateField(null=True, blank=True)
+    risk_score      = models.FloatField(null=True, blank=True)
+    priority        = models.CharField(max_length=20, blank=True)
+    risk_updated_at = models.DateTimeField(null=True, blank=True)
+
     class Meta:
         ordering = ['-published']
         verbose_name = 'CVE Alert'

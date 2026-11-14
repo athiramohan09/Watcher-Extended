@@ -42,6 +42,18 @@ const FILTER_CONFIG = [
             { value: 'LOW',      label: 'Low' },
         ]
     },
+    {
+        key: 'priority',
+        type: 'select',
+        label: 'Priority',
+        width: 2,
+        options: [
+            { value: 'P1', label: 'P1' },
+            { value: 'P2', label: 'P2' },
+            { value: 'P3', label: 'P3' },
+            { value: 'P4', label: 'P4' },
+        ]
+    },
 ];
 
 const EmptyHitsState = ({ type }) => (
@@ -122,6 +134,10 @@ class CVEVulnerabilities extends Component {
         if (filters.severity) {
             filtered = filtered.filter(c => c.severity === filters.severity);
         }
+        // RISK SCORING (2026-11-10): filter by computed priority P1-P4.
+        if (filters.priority) {
+            filtered = filtered.filter(c => c.priority === filters.priority);
+        }
         return filtered;
     };
 
@@ -139,6 +155,18 @@ class CVEVulnerabilities extends Component {
     renderSeverityBadge = (severity) => {
         if (!severity) return <span className="text-muted">-</span>;
         return <span className={`badge ${SEVERITY_BADGE[severity] || 'bg-secondary'}`}>{severity}</span>;
+    };
+
+    // RISK SCORING (2026-11-10): priority and KEV badges for the CVE list.
+    renderPriorityBadge = (priority) => {
+        if (!priority) return <span className="text-muted">-</span>;
+        const cls = { P1: 'bg-danger', P2: 'bg-warning text-dark', P3: 'bg-info text-dark', P4: 'bg-secondary' }[priority] || 'bg-secondary';
+        return <span className={`badge ${cls}`}>{priority}</span>;
+    };
+
+    renderKevBadge = (isKev) => {
+        if (!isKev) return <span className="text-muted">-</span>;
+        return <span className="badge bg-danger">EXPLOITED — KEV</span>;
     };
 
     openDetailModal = (hit) =>
@@ -189,6 +217,26 @@ class CVEVulnerabilities extends Component {
                                 <dd className="col-sm-9">
                                     {cve.cvss_score != null ? (
                                         <span className="fw-semibold">{cve.cvss_score}</span>
+                                    ) : (
+                                        <span className="text-muted">-</span>
+                                    )}
+                                </dd>
+
+                                <dt className="col-sm-3">Risk Score</dt>
+                                <dd className="col-sm-9">
+                                    {cve.risk_score != null ? (
+                                        <span className="fw-semibold">{cve.risk_score}</span>
+                                    ) : (
+                                        <span className="text-muted">Not scored yet — run enrich_risk_scores</span>
+                                    )}
+                                    {' '}{this.renderPriorityBadge(cve.priority)}
+                                    {' '}{this.renderKevBadge(cve.is_kev)}
+                                </dd>
+
+                                <dt className="col-sm-3">EPSS</dt>
+                                <dd className="col-sm-9">
+                                    {cve.epss_score != null ? (
+                                        <span>{(cve.epss_score * 100).toFixed(1)}% probability of exploitation in the next 30 days (FIRST)</span>
                                     ) : (
                                         <span className="text-muted">-</span>
                                     )}
@@ -316,6 +364,7 @@ class CVEVulnerabilities extends Component {
                                                         <th role="button" onClick={() => handleSort('object_id')}>
                                                             CVE ID {renderSortIcons('object_id')}
                                                         </th>
+                                                        <th className="text-center">Risk</th>
                                                         <th role="button" onClick={() => handleSort('matched_keyword')}>
                                                             Keyword {renderSortIcons('matched_keyword')}
                                                         </th>
@@ -351,6 +400,13 @@ class CVEVulnerabilities extends Component {
                                                                             <span className="ms-2">
                                                                                 {this.renderSeverityBadge(cve.severity)}
                                                                             </span>
+                                                                        )}
+                                                                    </td>
+                                                                    <td className="text-center align-middle">
+                                                                        {cve && cve.risk_score != null ? (
+                                                                            <span><strong>{cve.risk_score}</strong> {this.renderPriorityBadge(cve.priority)}</span>
+                                                                        ) : (
+                                                                            <span className="text-muted">-</span>
                                                                         )}
                                                                     </td>
                                                                     <td className="align-middle">
@@ -435,6 +491,13 @@ class CVEVulnerabilities extends Component {
                                                         <th className="text-center" role="button" onClick={() => handleSort('cvss_score')}>
                                                             CVSS {renderSortIcons('cvss_score')}
                                                         </th>
+                                                        <th className="text-center" role="button" onClick={() => handleSort('risk_score')}>
+                                                            Risk {renderSortIcons('risk_score')}
+                                                        </th>
+                                                        <th className="text-center" role="button" onClick={() => handleSort('epss_score')}>
+                                                            EPSS {renderSortIcons('epss_score')}
+                                                        </th>
+                                                        <th className="text-center">KEV</th>
                                                         <th>Information</th>
                                                         <th className="text-center" role="button" onClick={() => handleSort('published')}>
                                                             Published {renderSortIcons('published')}
@@ -471,6 +534,24 @@ class CVEVulnerabilities extends Component {
                                                                     ) : (
                                                                         <span className="text-muted">-</span>
                                                                     )}
+                                                                </td>
+                                                                <td className="text-center align-middle">
+                                                                    {cve.risk_score != null ? (
+                                                                        <span className="fw-semibold">{cve.risk_score}</span>
+                                                                    ) : (
+                                                                        <span className="text-muted">-</span>
+                                                                    )}
+                                                                    {' '}{this.renderPriorityBadge(cve.priority)}
+                                                                </td>
+                                                                <td className="text-center align-middle">
+                                                                    {cve.epss_score != null ? (
+                                                                        <span>{(cve.epss_score * 100).toFixed(1)}%</span>
+                                                                    ) : (
+                                                                        <span className="text-muted">-</span>
+                                                                    )}
+                                                                </td>
+                                                                <td className="text-center align-middle">
+                                                                    {this.renderKevBadge(cve.is_kev)}
                                                                 </td>
                                                                 <td className="align-middle" style={{ maxWidth: '380px' }}>
                                                                     {cve.description && cve.description.length > 50 ? (

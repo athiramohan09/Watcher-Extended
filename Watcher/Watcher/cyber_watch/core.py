@@ -79,6 +79,233 @@ def _extract_cve_description(item):
 
 
 
+# ---------------------------------------------------------------------------
+# RISK SCORING / VULNERABILITY PRIORITISATION (2026-11-10)
+# "Patch First" - rank CVEs by real exploit risk, not by CVSS alone.
+#
+# Sources (both free, no API key, no new library - requests already used):
+#  * EPSS - FIRST, https://api.first.org/data/v1/epss
+#    A machine-learning model, pre-trained by FIRST on millions of CVEs.
+#    It returns the probability (0-1) that a CVE is exploited in the
+#    next 30 days, plus a percentile. We do NOT train a model on the
+#    user's ~338 local CVEs - that would be far too little data.
+#  * CISA KEV - https://www.cisa.gov/sites/default/files/feeds/
+#    known_exploited_vulnerabilities.json
+#    The official list of vulnerabilities known to be exploited in the
+#    wild. If a CVE is on it, it is already being used by attackers.
+#
+# Formula (transparent, documented so a professor can check it):
+#     risk_score = (40 if is_kev else 0)
+#                + epss * 30            (epss 0-1, missing -> 0)
+#                + (cvss / 10) * 20     (cvss missing -> 0)
+#                + (10 if published within the last 30 days else 0)
+#     capped to 0-100, rounded to 1 decimal.
+# Priority: P1 >= 80, P2 60-79, P3 40-59, P4 < 40.
+#
+# Example: a KEV CVE with EPSS 0.94 and CVSS 7.5, published recently:
+#     40 + 0.94*30 + (7.5/10)*20 + 10 = 40 + 28.2 + 15 + 10 = 93.2 -> P1
+# A CVE with EPSS 0.02 and CVSS 4.0, published long ago:
+#     0 + 0.6 + 8.0 + 0 = 8.6 -> P4
+# So a KEV CVE outranks a higher-CVSS CVE that nobody is exploiting.
+#
+# Failure behaviour: warn-and-skip, never crash the CVE fetch or the
+# scheduler. If EPSS is down, scores are still computed from KEV +
+# CVSS + recency (EPSS part = 0). If KEV is down, existing is_kev
+# flags are NOT cleared - only a successful KEV fetch updates them.
+# "Threat prediction" here means EPSS probability + trends, not a
+# guarantee that an attack will happen.
+# ---------------------------------------------------------------------------
+
+EPSS_API_URL = "https://api.first.org/data/v1/epss"
+KEV_FEED_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+_EPSS_BATCH_SIZE = 100
+
+
+def calculate_risk_score(cvss_score, epss_score, is_kev, published):
+    """Transparent risk score 0-100 and priority label for one CVE.
+
+    :param cvss_score: float or None (missing -> 0 for this part)
+    :param epss_score: float 0-1 or None (missing -> 0)
+    :param is_kev: bool, True if the CVE is on the CISA KEV list
+    :param published: datetime/date or None
+    :return: (risk_score float, priority str 'P1'..'P4')
+    """
+    try:
+        cvss = float(cvss_score) if cvss_score is not None else 0.0
+    except (TypeError, ValueError):
+        cvss = 0.0
+    cvss = max(0.0, min(10.0, cvss))
+    try:
+        epss = float(epss_score) if epss_score is not None else 0.0
+    except (TypeError, ValueError):
+        epss = 0.0
+    epss = max(0.0, min(1.0, epss))
+
+    score = 0.0
+    if is_kev:
+        score += 40.0
+    score += epss * 30.0
+    score += (cvss / 10.0) * 20.0
+    if published is not None:
+        try:
+            pub_date = published.date() if hasattr(published, 'date') else published
+            age_days = (timezone.now().date() - pub_date).days
+            if 0 <= age_days <= 30:
+                score += 10.0
+        except Exception:
+            pass
+    score = round(max(0.0, min(100.0, score)), 1)
+    if score >= 80:
+        priority = 'P1'
+    elif score >= 60:
+        priority = 'P2'
+    elif score >= 40:
+        priority = 'P3'
+    else:
+        priority = 'P4'
+    return score, priority
+
+
+def _fetch_epss_batch(cve_ids):
+    """Fetch EPSS scores for a list of CVE ids. Returns {cve_id: (epss, percentile)}.
+
+    Uses the batch form ?cve=CVE-...,...,CVE-... (comma-separated).
+    Any failure returns {} and logs a warning - callers must not crash.
+    """
+    result = {}
+    if not cve_ids:
+        return result
+    for start in range(0, len(cve_ids), _EPSS_BATCH_SIZE):
+        batch = cve_ids[start:start + _EPSS_BATCH_SIZE]
+        url = EPSS_API_URL + "?cve=" + ",".join(batch)
+        data, err = _get_json(url, timeout=30)
+        if err:
+            logger.warning(f"EPSS unavailable for batch of {len(batch)} CVEs: {err} - EPSS part of the score will be 0 for these")
+            continue
+        items = data.get('data') if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            logger.warning("EPSS returned unexpected shape - expected {'data': [...]}")
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            cve_id = (item.get('cve') or '').strip().upper()
+            if not cve_id:
+                continue
+            try:
+                epss = float(item.get('epss')) if item.get('epss') is not None else None
+            except (TypeError, ValueError):
+                epss = None
+            try:
+                percentile = float(item.get('percentile')) if item.get('percentile') is not None else None
+            except (TypeError, ValueError):
+                percentile = None
+            result[cve_id] = (epss, percentile)
+    return result
+
+
+def _fetch_kev():
+    """Fetch the CISA KEV list. Returns {CVE-ID: dateAdded (date or None)} or None on failure.
+
+    Returns None (not {}) on failure so the caller can tell "fetch
+    failed" apart from "no KEV entries" and must not clear existing flags.
+    """
+    data, err = _get_json(KEV_FEED_URL, timeout=30)
+    if err:
+        logger.warning(f"CISA KEV feed unavailable: {err} - existing KEV flags will be kept")
+        return None
+    vulns = data.get('vulnerabilities') if isinstance(data, dict) else None
+    if not isinstance(vulns, list):
+        logger.warning("CISA KEV feed returned unexpected shape - expected {'vulnerabilities': [...]}")
+        return None
+    result = {}
+    for item in vulns:
+        if not isinstance(item, dict):
+            continue
+        cve_id = (item.get('cveID') or '').strip().upper()
+        if not cve_id:
+            continue
+        added = None
+        raw = item.get('dateAdded')
+        if raw:
+            try:
+                from datetime import date as _date
+                added = _date.fromisoformat(str(raw)[:10])
+            except Exception:
+                added = None
+        result[cve_id] = added
+    logger.info(f"CISA KEV feed loaded - {len(result)} known exploited vulnerabilities")
+    return result
+
+
+def enrich_cve_risk_scores(limit=None, force=False):
+    """Enrich stored CVEs with EPSS + KEV and compute risk_score/priority.
+
+    :param limit: enrich at most this many CVEs (None = all), newest first
+    :param force: if False, only CVEs that have never been scored
+        (risk_score is NULL) are enriched; if True, re-score everything
+    :return: dict with enriched/kev counts and the top 5 by risk_score
+    """
+    try:
+        close_old_connections()
+    except Exception:
+        pass
+    logger.info("CRON TASK : Enrich CVE risk scores (EPSS + CISA KEV)")
+    qs = CVEAlert.objects.all().order_by('-published')
+    if not force:
+        qs = qs.filter(risk_score__isnull=True)
+    if limit:
+        try:
+            qs = qs[:int(limit)]
+        except (TypeError, ValueError):
+            pass
+    cves = list(qs)
+    if not cves:
+        logger.info("Risk enrichment - no CVEs to score")
+        return {'enriched': 0, 'kev': 0, 'top_5': []}
+
+    kev = _fetch_kev()
+    kev_ok = kev is not None
+    if kev is None:
+        kev = {}
+    epss_map = _fetch_epss_batch([c.cve_id for c in cves])
+
+    enriched = 0
+    kev_count = 0
+    now = timezone.now()
+    for cve in cves:
+        epss, percentile = epss_map.get(cve.cve_id.upper(), (None, None))
+        if kev_ok:
+            # Only a successful KEV fetch updates the flag.
+            cve.is_kev = cve.cve_id.upper() in kev
+            cve.kev_date_added = kev.get(cve.cve_id.upper())
+        if cve.is_kev:
+            kev_count += 1
+        cve.epss_score = epss
+        cve.epss_percentile = percentile
+        score, priority = calculate_risk_score(cve.cvss_score, epss, cve.is_kev, cve.published)
+        cve.risk_score = score
+        cve.priority = priority
+        cve.risk_updated_at = now
+        cve.save(update_fields=[
+            'epss_score', 'epss_percentile', 'is_kev', 'kev_date_added',
+            'risk_score', 'priority', 'risk_updated_at',
+        ])
+        enriched += 1
+
+    top = (
+        CVEAlert.objects.filter(risk_score__isnull=False)
+        .order_by('-risk_score', '-published')[:5]
+    )
+    top_5 = [
+        {'cve_id': c.cve_id, 'risk_score': c.risk_score, 'priority': c.priority,
+         'epss_score': c.epss_score, 'is_kev': c.is_kev, 'cvss_score': c.cvss_score}
+        for c in top
+    ]
+    logger.info(f"Risk enrichment complete - {enriched} CVEs scored, {kev_count} on CISA KEV")
+    return {'enriched': enriched, 'kev': kev_count, 'top_5': top_5}
+
+
 def start_scheduler():
     """
     Launch multiple planning tasks in background:
@@ -98,6 +325,12 @@ def start_scheduler():
         max_instances=1,
         replace_existing=True)
     scheduler.add_job(generate_daily_threat_report, 'cron', hour=8, minute=0, id='daily_threat_report',
+        max_instances=1,
+        replace_existing=True)
+    # RISK SCORING (2026-11-10): enrich CVEs with EPSS + CISA KEV and
+    # compute risk_score, daily at 08:30 - after the 08:00 daily report,
+    # so the report for the next day can use the fresh scores.
+    scheduler.add_job(enrich_cve_risk_scores, 'cron', hour=8, minute=30, id='enrich_cve_risk_scores',
         max_instances=1,
         replace_existing=True)
     scheduler.start()

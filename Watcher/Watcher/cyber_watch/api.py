@@ -20,13 +20,27 @@ class CVEAlertViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """Filter CVE alerts based on query parameters."""
         archived = self.request.query_params.get('archived', 'false').lower() in ('true', '1', 'yes')
-        queryset = CVEAlert.objects.filter(is_archived=archived).order_by('-published')
-        
+        queryset = CVEAlert.objects.filter(is_archived=archived)
+
         # Filter by severity level
         severity = self.request.query_params.get('severity')
         if severity:
             queryset = queryset.filter(severity=severity.upper())
-        
+
+        # RISK SCORING (2026-11-10): filters for the Patch First queue.
+        is_kev = self.request.query_params.get('is_kev')
+        if is_kev is not None:
+            queryset = queryset.filter(is_kev=is_kev.lower() in ('true', '1', 'yes'))
+        min_epss = self.request.query_params.get('min_epss')
+        if min_epss is not None:
+            try:
+                queryset = queryset.filter(epss_score__gte=float(min_epss))
+            except (TypeError, ValueError):
+                pass
+        priority = self.request.query_params.get('priority')
+        if priority:
+            queryset = queryset.filter(priority=priority.upper())
+
         # Filter by publication date range
         days = self.request.query_params.get('days')
         if days:
@@ -35,8 +49,20 @@ class CVEAlertViewSet(viewsets.ModelViewSet):
                 queryset = queryset.filter(published__gte=since)
             except (ValueError, TypeError):
                 pass
-        
-        return queryset
+
+        # Ordering: ?ordering=-risk_score (Patch First), -published
+        # (default), -cvss_score, cve_id. Anything else falls back to
+        # -published. Unscored CVEs (risk_score NULL) sort last.
+        ordering = self.request.query_params.get('ordering')
+        allowed = {'risk_score', '-risk_score', 'published', '-published',
+                   'cvss_score', '-cvss_score', 'cve_id', '-cve_id'}
+        if ordering in allowed:
+            if ordering.lstrip('-') == 'risk_score':
+                from django.db.models import F
+                direction = F('risk_score').desc(nulls_last=True) if ordering.startswith('-') else F('risk_score').asc(nulls_last=True)
+                return queryset.order_by(direction, '-published')
+            return queryset.order_by(ordering, '-published')
+        return queryset.order_by('-published')
 
     @action(detail=True, methods=['patch'], permission_classes=[permissions.DjangoModelPermissions])
     def archive(self, request, pk=None):
